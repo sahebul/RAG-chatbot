@@ -1,0 +1,9 @@
+node_modules/
+src/logs
+venv
+questiontxt
+/.env
+/.gitlab-ci.yml.bkp
+.gitlab-ci.yml
+chroma_db
+documents
