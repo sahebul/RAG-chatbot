@@ -7,7 +7,8 @@ import pandas as pd
 import pdfplumber
 from datetime import datetime
 from typing import List
-
+#  It is a "Double-Ended Queue" that automatically throws away old items when it gets full.
+from collections import deque 
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -643,7 +644,7 @@ if previous_table_df is not None:
 documents = clean_documents(documents)
 documents = deduplicate_documents(documents)
 
-# Export tables to a markdown file
+# Export tables to a markdown file for debugging and visual inspection removed it on production
 with open("extracted_tables.md", "w", encoding="utf-8") as f:
     for doc in documents:
         if doc.metadata.get("content_type") == "table":
@@ -743,6 +744,7 @@ else:
     )
 
 # ========== Retrieval with Metadata ==========
+chat_history=deque(maxlen=10) # create a deque with maximum length of 10
 print("Chatbot started. Type 'exit' to quit.\n")
 
 while True:
@@ -750,15 +752,42 @@ while True:
     if query.lower() == 'exit':
         print("Chatbot closed.")
         break
+    #  CONDENSE QUESTION STEP
+    search_query=query
+    if len(chat_history)>0:
+        # Create a string representation of the last few messages
+        history_context = ""
+        for msg in list(chat_history)[-3:]: # Look at last 3 turns
+            role = "User" if msg["role"] == "user" else "Assistant"
+            history_context += f"{role}: {msg['content']}\n"
+        condense_prompt = f"""Given the following conversation and a follow-up question, rephrase the follow-up question to be a standalone question (in its original language). 
+Do NOT answer the question. Just return the rephrased question.
+Chat History:
+{history_context}
+Follow-up Input: {query}
+Standalone Question:"""
 
+        try:
+            condense_response = client.chat.completions.create(
+                model="minimax-m2.5-free",
+                messages=[{"role": "user", "content": condense_prompt}]
+            )
+            search_query = condense_response.choices[0].message.content.strip()
+            print(f"\n[Search refined to: {search_query}]") 
+        except Exception as e:
+            print(f"Error condensing question: {e}")
+            search_query = query # Fallback to original query
+
+    # End of  CONDENSE QUESTION STEP use search_query instead of query in the following steps except final response generation
+    
     # Hybrid retrieval: vector search + BM25 keyword search
     vector_results = vectorstore.similarity_search(
-        query,
+        search_query,
         k=20,
         filter={"source_file": "sample.pdf"}
     )
 
-    tokenized_query = tokenize_for_bm25(query)
+    tokenized_query = tokenize_for_bm25(search_query)
     bm25_scores = bm25.get_scores(tokenized_query)
     top_bm25_indices = sorted(
         range(len(bm25_scores)),
@@ -787,7 +816,7 @@ while True:
 
     # Rerank using cross-encoder
     doc_texts = [doc.page_content for doc in initial_results]
-    query_doc_pairs = [[query, doc] for doc in doc_texts]
+    query_doc_pairs = [[search_query, doc] for doc in doc_texts]
     rerank_scores = cross_encoder.predict(query_doc_pairs)
 
     # Sort by rerank scores and get top 3
@@ -798,7 +827,7 @@ while True:
     # Expand context with full tables after reranking to ensure they are not truncated
     results = expand_with_related_tables(results, docs)
 
-    # Save exact context to a markdown file as requested
+    # Save exact context to a markdown file as requested for debugging and visual inspection removed it on production
     with open("retrieved_context.md", "w", encoding="utf-8") as f:
         for r in results:
             f.write(f"### Source: Page {r.metadata.get('source_page', '?')}\n\n")
@@ -809,46 +838,57 @@ while True:
         f"[Source: Page {r.metadata.get('source_page', '?')}] {r.page_content}"
         for r in results
     ])
-
-    prompt = f"""You are given document context.
-
+    # Final Prompt ( using original 'query' here)
+    prompt = f"""You are provided with technical details regarding the RTPS Portal.
+    
 Your task:
-- Read the context carefully
-- Ignore noisy or corrupted text
-- Answer only using relevant information
-- If answer is missing, say "Not found"
+- Analyze the technical details carefully
+- Answer the user's question accurately using only these details
+- If the information is not available in the details, say "I don't have that information"
 
-DOCUMENT CONTEXT:
+TECHNICAL DETAILS:
 {context}
 
 QUESTION:
 {query}
 """
-
-    print(f"PROMP: {prompt}")
-    response = client.chat.completions.create(
-        model="minimax-m2.5-free",
-        messages=[
-    {
+    messages=[
+ {
         "role": "system",
         "content": """
-You are a helpful and polite document question-answering assistant.
+You are a helpful, professional, and polite assistant for the RTPS Portal(also known as Sewasetu portal).
 
 Rules:
-1. For questions about the document, answer ONLY from the provided context.
-2. If the user asks a question and the answer is not found in the context, politely say that you don't have that information in the provided document.
-3. If the user sends a basic greeting (e.g., "hi", "hello", "how are you") or expresses gratitude (e.g., "thanks"), respond politely and naturally without complaining about missing context. Offer your assistance to answer questions about the document.
+1. Answer questions based on the technical details provided to you. Do NOT mention that you are reading from a document, file, or provided context.
+2. If the user asks a question and the answer is not found in the technical details, politely state that you don't have that information at the moment.
+3. If the user sends a basic greeting (e.g., "hi", "hello", "how are you") or asks how you can help, respond naturally as an RTPS Portal support assistant. Mention that you can assist with:
+   - RTPS Portal integration details
+   - API requirements (Status update, Application track, Get certificate)
+   - POST URL and Return URL specifications
+   - Service ID and Portal Number requirements
+   - Applicant and application details structure
+   - Prerequisites for external portal integration
 4. Be concise, accurate, and professional.
-5. Prefer exact values and definitions from context.
-6. Ignore corrupted or unrelated text in the context.
+5. Prefer exact values and definitions from the provided details.
+6. Ignore any corrupted or unrelated text in the context.
+7. Always sound like a native part of the RTPS platform, not an AI reading a file.
+8. Treat "RTPS Portal" and "Sewasetu Portal" as the same entity. If the user asks about one, use the information available for the other.
 """
     },
-    {
+    ]
+    for msg in chat_history: 
+        messages.append(msg)
+    messages.append({
         "role": "user",
         "content": prompt
-    }
-]
+    })
+    # print(f"PROMP: {prompt}")
+    response = client.chat.completions.create(
+        model="minimax-m2.5-free",
+        messages=messages
     )
 
-    print("\nAI Answer:\n")
-    print(response.choices[0].message.content)
+    ai_answer = response.choices[0].message.content
+    print("\nAI Answer:\n", ai_answer)
+    chat_history.append({"role": "user", "content": query})
+    chat_history.append({"role": "assistant", "content": ai_answer})
