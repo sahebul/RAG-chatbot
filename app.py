@@ -21,6 +21,7 @@ from sentence_transformers import CrossEncoder
 from openai import OpenAI
 
 from rank_bm25 import BM25Okapi
+from docx import Document as DocxDocument
 
 
 load_dotenv()
@@ -485,150 +486,168 @@ def build_ingestion_signature(docs: List[Document]) -> str:
 
 
 # end of new cleaning
+# ========== Document Loaders ==========
+
+def load_pdf(file_path):
+    docs = []
+    previous_table_df = None
+    previous_table_metadata = None
+    file_name = os.path.basename(file_path)
+
+    with pdfplumber.open(file_path) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            # Normal text
+            text = page.extract_text()
+            if text:
+                docs.append(
+                    Document(
+                        page_content=text,
+                        metadata={
+                            "page": page_num,
+                            "is_table": False,
+                            "content_type": "text",
+                            "source_file": file_name
+                        }
+                    )
+                )
+
+            # Table extraction
+            tables = page.extract_tables()
+            for table_index, table in enumerate(tables):
+                if not table or is_blank_table(table):
+                    continue
+
+                df = pd.DataFrame(table).fillna("")
+
+                if previous_table_df is None:
+                    previous_table_df = df
+                    previous_table_metadata = {
+                        "page": page_num,
+                        "end_page": page_num,
+                        "is_table": True,
+                        "content_type": "table",
+                        "table_rows": len(previous_table_df),
+                        "table_columns": len(previous_table_df.columns),
+                        "table_index": table_index,
+                        "source_file": file_name
+                    }
+                    continue
+
+                if should_merge_table(previous_table_df, previous_table_metadata, df, page_num):
+                    df = drop_duplicate_header(previous_table_df, df)
+                    previous_table_df = pd.concat([previous_table_df, df], ignore_index=True)
+                    previous_table_metadata["table_rows"] = len(previous_table_df)
+                    previous_table_metadata["table_columns"] = len(previous_table_df.columns)
+                    previous_table_metadata["end_page"] = page_num
+                else:
+                    docs.append(
+                        Document(
+                            page_content=previous_table_df.to_markdown(index=False),
+                            metadata=previous_table_metadata
+                        )
+                    )
+                    previous_table_df = df
+                    previous_table_metadata = {
+                        "page": page_num,
+                        "end_page": page_num,
+                        "is_table": True,
+                        "content_type": "table",
+                        "table_rows": len(previous_table_df),
+                        "table_columns": len(previous_table_df.columns),
+                        "table_index": table_index,
+                        "source_file": file_name
+                    }
+
+    if previous_table_df is not None:
+        docs.append(
+            Document(
+                page_content=previous_table_df.to_markdown(index=False),
+                metadata=previous_table_metadata
+            )
+        )
+    return docs
+
+def load_docx(file_path):
+    doc = DocxDocument(file_path)
+    docs = []
+    file_name = os.path.basename(file_path)
+
+    # Extract text from paragraphs
+    full_text = []
+    for para in doc.paragraphs:
+        if para.text.strip():
+            full_text.append(para.text)
+    
+    if full_text:
+        docs.append(Document(
+            page_content="\n".join(full_text),
+            metadata={
+                "source_file": file_name,
+                "is_table": False,
+                "content_type": "text",
+                "page": 0
+            }
+        ))
+
+    # Extract tables
+    for i, table in enumerate(doc.tables):
+        data = []
+        for row in table.rows:
+            data.append([cell.text.strip() for cell in row.cells])
+        
+        if data:
+            df = pd.DataFrame(data)
+            # Use the first row as header if it exists
+            if not df.empty:
+                table_text = df.to_markdown(index=False)
+                docs.append(Document(
+                    page_content=table_text,
+                    metadata={
+                        "source_file": file_name,
+                        "is_table": True,
+                        "content_type": "table",
+                        "table_index": i,
+                        "table_rows": len(df),
+                        "table_columns": len(df.columns),
+                        "page": 0,
+                        "end_page": 0
+                    }
+                ))
+    return docs
+
+def load_txt(file_path):
+    file_name = os.path.basename(file_path)
+    with open(file_path, "r", encoding="utf-8") as f:
+        text = f.read()
+    
+    return [Document(
+        page_content=text,
+        metadata={
+            "source_file": file_name,
+            "is_table": False,
+            "content_type": "text",
+            "page": 0
+        }
+    )]
+
 # ========== Pipeline ==========
 DB_PATH = "./chroma_db"
 COLLECTION_NAME = "documents"
 
-# loader = PyPDFLoader("documents/sample.pdf")
-# documents = loader.load()
-# =============Extract Tables Separately if any======
-
 documents = []
+docs_dir = "documents"
 
-# ==========================================
-# TABLE MERGE STATE
-# ==========================================
-
-previous_table_df = None
-previous_table_metadata = None
-
-with pdfplumber.open("documents/sample.pdf") as pdf:
-
-    for page_num, page in enumerate(pdf.pages):
-
-        # ==========================================
-        # NORMAL TEXT
-        # ==========================================
-
-        text = page.extract_text()
-
-        if text:
-
-            documents.append(
-                Document(
-                    page_content=text,
-                    metadata={
-                        "page": page_num,
-                        "is_table": False,
-                        "content_type": "text"
-                    }
-                )
-            )
-
-        # ==========================================
-        # TABLE EXTRACTION
-        # ==========================================
-
-        tables = page.extract_tables()
-
-        for table_index, table in enumerate(tables):
-
-            # Skip empty tables
-            if not table or is_blank_table(table):
-                continue
-
-            df = pd.DataFrame(table).fillna("")
-
-            # ==========================================
-            # FIRST TABLE
-            # ==========================================
-
-            if previous_table_df is None:
-
-                previous_table_df = df
-
-                previous_table_metadata = {
-                    "page": page_num,
-                    "end_page": page_num,
-                    "is_table": True,
-                    "content_type": "table",
-                    "table_rows": len(previous_table_df),
-                    "table_columns": len(previous_table_df.columns),
-                    "table_index": table_index
-                }
-
-                continue
-
-            # ==========================================
-            # CHECK TABLE CONTINUATION
-            # ==========================================
-
-            # ==========================================
-            # MERGE TABLES
-            # ==========================================
-
-            should_merge = should_merge_table(
-                previous_table_df,
-                previous_table_metadata,
-                df,
-                page_num
-            )
-
-            if should_merge:
-
-                df = drop_duplicate_header(previous_table_df, df)
-
-                previous_table_df = pd.concat(
-                    [previous_table_df, df],
-                    ignore_index=True
-                )
-
-                previous_table_metadata["table_rows"] = len(previous_table_df)
-                previous_table_metadata["table_columns"] = len(previous_table_df.columns)
-                previous_table_metadata["end_page"] = page_num
-
-            else:
-
-                # ==========================================
-                # SAVE OLD TABLE
-                # ==========================================
-
-                table_text = previous_table_df.to_markdown(index=False)
-
-                documents.append(
-                    Document(
-                        page_content=table_text,
-                        metadata=previous_table_metadata
-                    )
-                )
-
-                # Start new table
-                previous_table_df = df
-
-                previous_table_metadata = {
-                    "page": page_num,
-                    "end_page": page_num,
-                    "is_table": True,
-                    "content_type": "table",
-                    "table_rows": len(previous_table_df),
-                    "table_columns": len(previous_table_df.columns),
-                    "table_index": table_index
-                }
-
-# ==========================================
-# SAVE LAST TABLE
-# ==========================================
-
-if previous_table_df is not None:
-
-    table_text = previous_table_df.to_markdown(index=False)
-
-    documents.append(
-        Document(
-            page_content=table_text,
-            metadata=previous_table_metadata
-        )
-    )
+for filename in os.listdir(docs_dir):
+    file_path = os.path.join(docs_dir, filename)
+    if filename.endswith(".pdf"):
+        print(f"Loading PDF: {filename}")
+        documents.extend(load_pdf(file_path))
+    elif filename.endswith(".docx"):
+        print(f"Loading DOCX: {filename}")
+        documents.extend(load_docx(file_path))
+    elif filename.endswith(".txt"):
+        print(f"Loading TXT: {filename}")
+        documents.extend(load_txt(file_path))
 
 # for i, doc in enumerate(documents):
 #     if doc.metadata.get("content_type") == "table":
@@ -674,12 +693,81 @@ for doc in documents:
 
 docs = final_docs
 
+# docs = add_chunk_metadata(docs, "sample.pdf") # Removed hardcoded source
+# Instead, add_chunk_metadata should be updated to not overwrite source_file if it's already there
+# But wait, add_chunk_metadata is called with a source_file argument. Let's fix that function too.
 
-docs = add_chunk_metadata(docs, "sample.pdf")
+def add_chunk_metadata_v2(
+    docs: List[Document],
+    default_doc_type: str = "api_documentation"
+) -> List[Document]:
+
+    total_chunks = len(docs)
+
+    for i, doc in enumerate(docs):
+
+        section_title = extract_section_title(
+            doc.page_content
+        )
+
+        original_content_type = doc.metadata.get("content_type")
+        semantic_content_type = classify_content(
+            doc.page_content
+        )
+        content_type = (
+            original_content_type
+            if original_content_type == "table"
+            else semantic_content_type
+        )
+
+        semantic_features = detect_semantic_features(
+            doc.page_content
+        )
+
+        chunk_hash = hashlib.md5(
+            doc.page_content.encode()
+        ).hexdigest()[:12]
+
+        doc.metadata.update({
+
+            # Source tracking (preserve if already set by loader)
+            "source_file": doc.metadata.get("source_file", "unknown_source"),
+            "doc_type": doc.metadata.get("doc_type", default_doc_type),
+
+            # Chunk tracking
+            "chunk_index": i,
+            "total_chunks": total_chunks,
+            "chunk_id": chunk_hash,
+
+            # Section awareness
+            "section_title": section_title,
+
+            # Classification
+            "content_type": content_type,
+            "semantic_content_type": semantic_content_type,
+
+            # Debugging / observability
+            "char_count": len(doc.page_content),
+            "word_count": len(doc.page_content.split()),
+
+            # Timestamp
+            "ingestion_timestamp": datetime.now().isoformat(),
+
+            # Semantic features
+            **semantic_features
+        })
+
+        # Preserve source page if available
+        if "page" in doc.metadata:
+            doc.metadata["source_page"] = doc.metadata["page"]
+
+    return docs
+
+docs = add_chunk_metadata_v2(docs)
 ingestion_signature = build_ingestion_signature(docs)
 collection_metadata = {
-    "source_file": "sample.pdf",
     "ingestion_signature": ingestion_signature,
+    "total_files": len(os.listdir(docs_dir))
 }
 
 bm25_corpus = [
@@ -783,8 +871,7 @@ Standalone Question:"""
     # Hybrid retrieval: vector search + BM25 keyword search
     vector_results = vectorstore.similarity_search(
         search_query,
-        k=20,
-        filter={"source_file": "sample.pdf"}
+        k=20
     )
 
     tokenized_query = tokenize_for_bm25(search_query)
@@ -835,11 +922,11 @@ Standalone Question:"""
             f.write("\n\n")
 
     context = "\n".join([
-        f"[Source: Page {r.metadata.get('source_page', '?')}] {r.page_content}"
+        f"[Source: {r.metadata.get('source_file', 'Unknown')} | Page: {r.metadata.get('source_page', '?')}] {r.page_content}"
         for r in results
     ])
     # Final Prompt ( using original 'query' here)
-    prompt = f"""You are provided with technical details regarding the RTPS Portal.
+    prompt = f"""You are provided with technical details from various integration documents and knowledge bases.
     
 Your task:
 - Analyze the technical details carefully
@@ -856,23 +943,17 @@ QUESTION:
  {
         "role": "system",
         "content": """
-You are a helpful, professional, and polite assistant for the RTPS Portal(also known as Sewasetu portal).
+You are a helpful, professional, and polite Technical Support Assistant specializing in system integrations and API documentation.
 
 Rules:
 1. Answer questions based on the technical details provided to you. Do NOT mention that you are reading from a document, file, or provided context.
 2. If the user asks a question and the answer is not found in the technical details, politely state that you don't have that information at the moment.
-3. If the user sends a basic greeting (e.g., "hi", "hello", "how are you") or asks how you can help, respond naturally as an RTPS Portal support assistant. Mention that you can assist with:
-   - RTPS Portal integration details
-   - API requirements (Status update, Application track, Get certificate)
-   - POST URL and Return URL specifications
-   - Service ID and Portal Number requirements
-   - Applicant and application details structure
-   - Prerequisites for external portal integration
+3. If the user sends a basic greeting (e.g., "hi", "hello", "how are you") or asks how you can help, respond naturally as a Technical Assistant. Mention that you can assist with technical integration details, API requirements, and system specifications found in your documentation.
 4. Be concise, accurate, and professional.
 5. Prefer exact values and definitions from the provided details.
 6. Ignore any corrupted or unrelated text in the context.
-7. Always sound like a native part of the RTPS platform, not an AI reading a file.
-8. Treat "RTPS Portal" and "Sewasetu Portal" as the same entity. If the user asks about one, use the information available for the other.
+7. Always sound like a native part of the support platform, not an AI reading a file.
+8. If the information pertains to the "RTPS Portal" or "Sewasetu Portal", treat them as the same entity.
 """
     },
     ]
